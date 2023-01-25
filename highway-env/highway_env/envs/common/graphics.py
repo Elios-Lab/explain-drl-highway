@@ -1,0 +1,355 @@
+import os
+from typing import TYPE_CHECKING, Callable, List, Optional
+import numpy as np
+import pygame
+
+from highway_env.envs.common.action import ActionType, DiscreteMetaAction, ContinuousAction
+from highway_env.road.graphics import WorldSurface, RoadGraphics
+from highway_env.vehicle.graphics import VehicleGraphics
+
+if TYPE_CHECKING:
+    from highway_env.envs import AbstractEnv
+    from highway_env.envs.common.abstract import Action
+
+
+class EnvViewer(object):
+
+    """A viewer to render a highway driving environment."""
+
+    SAVE_IMAGES = False
+
+    def __init__(self, env: 'AbstractEnv', config: Optional[dict] = None) -> None:
+        self.env = env
+        self.config = config or env.config
+        self.offscreen = self.config["offscreen_rendering"]
+
+        pygame.init()
+        pygame.display.set_caption("Highway-env")
+        panel_size = (self.config["screen_width"], self.config["screen_height"])
+
+        # A display is not mandatory to draw things. Ignoring the display.set_mode()
+        # instruction allows the drawing to be done on surfaces without
+        # handling a screen display, useful for e.g. cloud computing
+        if not self.offscreen:
+            self.screen = pygame.display.set_mode([self.config["screen_width"], self.config["screen_height"]])
+        self.sim_surface = WorldSurface(panel_size, 0, pygame.Surface(panel_size))
+        self.sim_surface.scaling = self.config.get("scaling", self.sim_surface.INITIAL_SCALING)
+        self.sim_surface.centering_position = self.config.get("centering_position", self.sim_surface.INITIAL_CENTERING)
+        self.clock = pygame.time.Clock()
+
+        self.enabled = True
+        if os.environ.get("SDL_VIDEODRIVER", None) == "dummy":
+            self.enabled = False
+
+        self.observer_vehicle = None
+        self.agent_display = None
+        self.agent_surface = None
+        self.vehicle_trajectory = None
+        self.frame = 0
+        self.directory = None
+
+    def set_agent_display(self, agent_display: Callable) -> None:
+        """
+        Set a display callback provided by an agent
+
+        So that they can render their behaviour on a dedicated agent surface, or even on the simulation surface.
+
+        :param agent_display: a callback provided by the agent to display on surfaces
+        """
+        if self.agent_display is None:
+            if not self.offscreen:
+                if self.config["screen_width"] > self.config["screen_height"]:
+                    self.screen = pygame.display.set_mode((self.config["screen_width"],
+                                                           2 * self.config["screen_height"]))
+                else:
+                    self.screen = pygame.display.set_mode((2 * self.config["screen_width"],
+                                                           self.config["screen_height"]))
+            self.agent_surface = pygame.Surface((self.config["screen_width"], self.config["screen_height"]))
+        self.agent_display = agent_display
+
+    def set_agent_action_sequence(self, actions: List['Action']) -> None:
+        """
+        Set the sequence of actions chosen by the agent, so that it can be displayed
+
+        :param actions: list of action, following the env's action space specification
+        """
+      
+        if isinstance(self.env.action_type, DiscreteMetaAction):
+            actions = [self.env.action_type.actions[a] for a in actions]
+        if len(actions) > 1:
+            self.vehicle_trajectory = self.env.vehicle.predict_trajectory(actions,
+                                                                          1 / self.env.config["policy_frequency"],
+                                                                          1 / 3 / self.env.config["policy_frequency"],
+                                                                          1 / self.env.config["simulation_frequency"])
+
+    def handle_events(self) -> None:
+        """Handle pygame events by forwarding them to the display and environment vehicle."""
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.env.close()
+            self.sim_surface.handle_event(event)
+            if self.env.action_type:
+                EventHandler.handle_event(self.env.action_type, event)
+        
+            
+
+    def display(self) -> None:
+        """Display the road and vehicles on a pygame window."""
+        if not self.enabled:
+            return
+
+        self.sim_surface.move_display_window_to(self.window_position())
+        RoadGraphics.display(self.env.road, self.sim_surface)
+
+        if self.vehicle_trajectory:
+            VehicleGraphics.display_trajectory(
+                self.vehicle_trajectory,
+                self.sim_surface,
+                offscreen=self.offscreen)
+
+        RoadGraphics.display_road_objects(
+            self.env.road,
+            self.sim_surface,
+            offscreen=self.offscreen
+        )
+
+        if self.agent_display:
+            self.agent_display(self.agent_surface, self.sim_surface)
+            if not self.offscreen:
+                if self.config["screen_width"] > self.config["screen_height"]:
+                    self.screen.blit(self.agent_surface, (0, self.config["screen_height"]))
+                else:
+                    self.screen.blit(self.agent_surface, (self.config["screen_width"], 0))
+
+        RoadGraphics.display_traffic(
+            self.env.road,
+            self.sim_surface,
+            simulation_frequency=self.env.config["simulation_frequency"],
+            offscreen=self.offscreen)
+
+        ObservationGraphics.display(self.env.observation_type, self.sim_surface)
+        ObservationGraphics.displayKinObs(self.env.observation_type, self.sim_surface, self.env.actionn)
+        
+        if not self.offscreen:
+            self.screen.blit(self.sim_surface, (0, 0))
+            if self.env.config["real_time_rendering"]:
+                self.clock.tick(self.env.config["simulation_frequency"])
+            pygame.display.flip()
+
+        if self.SAVE_IMAGES and self.directory:
+            pygame.image.save(self.sim_surface, str(self.directory / "highway-env_{}.png".format(self.frame)))
+            self.frame += 1
+
+    def get_image(self) -> np.ndarray:
+        """
+        The rendered image as a rgb array.
+
+        OpenAI gym's channel convention is H x W x C
+        """
+        surface = self.screen if self.config["render_agent"] and not self.offscreen else self.sim_surface
+        data = pygame.surfarray.array3d(surface)  # in W x H x C channel convention
+        return np.moveaxis(data, 0, 1)
+
+    def window_position(self) -> np.ndarray:
+        """the world position of the center of the displayed window."""
+        if self.observer_vehicle:
+            return self.observer_vehicle.position
+        elif self.env.vehicle:
+            return self.env.vehicle.position
+        else:
+            return np.array([0, 0])
+
+    def close(self) -> None:
+        """Close the pygame window."""
+        pygame.quit()
+
+
+class EventHandler(object):
+    @classmethod
+    def handle_event(cls, action_type: ActionType, event: pygame.event.EventType) -> None:
+        """
+        Map the pygame keyboard events to control decisions
+
+        :param action_type: the ActionType that defines how the vehicle is controlled
+        :param event: the pygame event
+        """
+        if isinstance(action_type, DiscreteMetaAction):
+            cls.handle_discrete_action_event(action_type, event)
+        elif action_type.__class__ == ContinuousAction:
+            cls.handle_continuous_action_event(action_type, event)
+
+    @classmethod
+    def handle_discrete_action_event(cls, action_type: DiscreteMetaAction, event: pygame.event.EventType) -> None:
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_RIGHT and action_type.longitudinal:
+                action_type.act(action_type.actions_indexes["FASTER"])
+            if event.key == pygame.K_LEFT and action_type.longitudinal:
+                action_type.act(action_type.actions_indexes["SLOWER"])
+            if event.key == pygame.K_DOWN and action_type.lateral:
+                action_type.act(action_type.actions_indexes["LANE_RIGHT"])
+            if event.key == pygame.K_UP:
+                action_type.act(action_type.actions_indexes["LANE_LEFT"])
+
+    @classmethod
+    def handle_continuous_action_event(cls, action_type: ContinuousAction, event: pygame.event.EventType) -> None:
+        action = action_type.last_action.copy()
+        steering_index = action_type.space().shape[0] - 1
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_RIGHT and action_type.lateral:
+                action[steering_index] = 0.7
+            if event.key == pygame.K_LEFT and action_type.lateral:
+                action[steering_index] = -0.7
+            if event.key == pygame.K_DOWN and action_type.longitudinal:
+                action[0] = -0.7
+            if event.key == pygame.K_UP and action_type.longitudinal:
+                action[0] = 0.7
+        elif event.type == pygame.KEYUP:
+            if event.key == pygame.K_RIGHT and action_type.lateral:
+                action[steering_index] = 0
+            if event.key == pygame.K_LEFT and action_type.lateral:
+                action[steering_index] = 0
+            if event.key == pygame.K_DOWN and action_type.longitudinal:
+                action[0] = 0
+            if event.key == pygame.K_UP and action_type.longitudinal:
+                action[0] = 0
+        action_type.act(action)
+
+
+class ObservationGraphics(object):
+    COLOR = (0, 0, 0)
+
+    @classmethod
+    def display(cls, obs, sim_surface):
+        from highway_env.envs.common.observation import LidarObservation
+        if isinstance(obs, LidarObservation):
+            cls.display_grid(obs, sim_surface)
+
+    @classmethod
+    def display_grid(cls, lidar_observation, surface):
+        psi = np.repeat(np.arange(-lidar_observation.angle/2,
+                                  2 * np.pi - lidar_observation.angle/2,
+                                  2 * np.pi / lidar_observation.grid.shape[0]), 2)
+        psi = np.hstack((psi[1:], [psi[0]]))
+        r = np.repeat(np.minimum(lidar_observation.grid[:, 0], lidar_observation.maximum_range), 2)
+        points = [(surface.pos2pix(lidar_observation.origin[0] + r[i] * np.cos(psi[i]),
+                                   lidar_observation.origin[1] + r[i] * np.sin(psi[i])))
+                  for i in range(np.size(psi))]
+        pygame.draw.lines(surface, ObservationGraphics.COLOR, True, points, 1)
+
+    @classmethod
+    def displayKinObs(cls, obs, sim_surface, action):
+        from highway_env.envs.common.observation import KinematicObservation
+        if isinstance(obs, KinematicObservation):
+            cls.displayText(obs, sim_surface, KinematicObservation, action)
+
+    @classmethod
+    def displayText(cls, kin_obs, surface, kinematics, action):
+        
+        # get font object
+        pygame.font.init()
+        font = pygame.font.SysFont('Arial', 12, bold=True)   
+
+        if (action == None):
+           act = font.render('', True, (0,0,0))
+        if (action == 0):
+          act = font.render('LANE_LEFT', True, (0,0,0))
+        if (action == 1):
+          act = font.render('IDLE', True, (0,0,0))
+        if (action == 2):
+          act = font.render('LANE_RIGHT', True, (0,0,0))
+        if (action == 3):
+          act = font.render('FASTER', True, (0,0,0))
+        if (action == 4):
+          act = font.render('SLOWER', True, (0,0,0))
+        
+        v1 = font.render('V1', True, (255,255,255))
+        v2 = font.render('V2', True, (255,255,255))
+        v3 = font.render('V3', True, (255,255,255))
+        v4 = font.render('V4', True, (255,255,255))
+        v5 = font.render('V5', True, (255,255,255))
+        v6 = font.render('V6', True, (255,255,255))
+        v7 = font.render('V7', True, (255,255,255))
+        v8 = font.render('V8', True, (255,255,255))
+        v9 = font.render('V9', True, (255,255,255))
+        v10 = font.render('V10', True, (255,255,255))
+        v11 = font.render('V11', True, (255,255,255))
+        v12 = font.render('V12', True, (255,255,255))
+        v13 = font.render('V13', True, (255,255,255))
+        v14 = font.render('V14', True, (255,255,255))
+        
+        v = [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14]
+        
+        obs, x, y = kin_obs.observe()
+        
+        #Action text
+        position = [500, 125]
+        #surface.blit(act, position)
+        
+        for i in range (len(x)):
+          position = [*surface.pos2pix(x[i], y[i])]
+          surface.blit(v[i], position)
+
+        '''
+        #v1 Text
+        position = [*surface.pos2pix(x[0], y[0])]
+        surface.blit(v1, position)
+
+        #v2 Text
+        position = [*surface.pos2pix(x[1], y[1])]
+        surface.blit(v2, position)
+
+        #v3 Text
+        position = [*surface.pos2pix(x[2], y[2])]
+        surface.blit(v3, position)
+
+        #v4 Text
+        position = [*surface.pos2pix(x[3], y[3])]
+        surface.blit(v4, position)
+
+        #v5 Text
+        position = [*surface.pos2pix(x[4], y[4])]
+        surface.blit(v5, position)
+
+        #v6 Text
+        position = [*surface.pos2pix(x[5], y[5])]
+        surface.blit(v6, position)
+
+        #v7 Text
+        position = [*surface.pos2pix(x[6], y[6])]
+        surface.blit(v7, position)
+
+        #v8 Text
+        position = [*surface.pos2pix(x[7], y[7])]
+        surface.blit(v8, position)
+
+        #v9 Text
+        position = [*surface.pos2pix(x[8], y[8])]
+        surface.blit(v9, position)
+        
+        #v10 Text
+        position = [*surface.pos2pix(x[9], y[9])]
+        surface.blit(v10, position)
+
+        #v11 Text
+        position = [*surface.pos2pix(x[10], y[10])]
+        surface.blit(v11, position)
+
+        #v12 Text
+        position = [*surface.pos2pix(x[11], y[11])]
+        surface.blit(v12, position)
+
+        #v13 Text
+        position = [*surface.pos2pix(x[12], y[12])]
+        surface.blit(v13, position)
+        
+        #v14 Text
+        position = [*surface.pos2pix(x[13], y[13])]
+        surface.blit(v14, position)
+        '''
+        
+        
+
+        
+        
+        
+        
