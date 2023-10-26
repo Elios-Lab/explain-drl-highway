@@ -55,3 +55,17 @@ rl-agents is a collection of reinforcement learning agents that can train on the
     }
     ```
 - `evaluation.py`: We edited the code so to keep trace of the q-value, image, action and state logs, which are needed for the agent analysis.
+
+## Citing
+Please, refer to [this paper](https://ieeexplore.ieee.org/document/10077125) for citing.
+```
+@ARTICLE{10077125,
+  author={Bellotti, Francesco and Lazzaroni, Luca and Capello, Alessio and Cossu, Marianna and De Gloria, Alessandro and Berta, Riccardo},
+  journal={IEEE Access}, 
+  title={Explaining a Deep Reinforcement Learning (DRL)-Based Automated Driving Agent in Highway Simulations}, 
+  year={2023},
+  volume={11},
+  number={},
+  pages={28522-28550},
+  doi={10.1109/ACCESS.2023.3259544}}
+```
